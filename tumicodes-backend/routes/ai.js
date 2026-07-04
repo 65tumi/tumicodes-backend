@@ -5,9 +5,9 @@ const { authenticateToken } = require('../middleware/auth');
 
 const AI_API_URL = 'https://ai.ultraxas.com/v1/chat';
 
-function callExternalAI(payload) {
+function callExternalAI(prompt) {
     return new Promise((resolve, reject) => {
-        const body = JSON.stringify(payload);
+        const body = JSON.stringify({ prompt });
         const url = new URL(AI_API_URL);
 
         const request = https.request(
@@ -18,7 +18,7 @@ function callExternalAI(payload) {
                 headers: {
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(body),
-                    Authorization: `Bearer ${process.env.AI_API_KEY}`
+                    'x-api-key': process.env.AI_API_KEY
                 }
             },
             (res) => {
@@ -31,20 +31,26 @@ function callExternalAI(payload) {
                 res.on('end', () => {
                     try {
                         const parsed = JSON.parse(data);
+
                         if (res.statusCode < 200 || res.statusCode >= 300) {
-                            return reject(new Error(parsed?.error?.message || `AI provider error: ${res.statusCode}`));
+                            return reject(
+                                new Error(
+                                    parsed.error ||
+                                    parsed.message ||
+                                    `AI provider error: ${res.statusCode}`
+                                )
+                            );
                         }
+
                         resolve(parsed);
-                    } catch (error) {
+                    } catch (err) {
                         reject(new Error('Invalid AI provider response'));
                     }
                 });
             }
         );
 
-        request.on('error', (error) => {
-            reject(error);
-        });
+        request.on('error', reject);
 
         request.write(body);
         request.end();
@@ -59,50 +65,53 @@ router.post('/', authenticateToken, async (req, res) => {
         });
     }
 
-    const { prompt, messages, model } = req.body;
+    const { prompt, messages } = req.body;
+
     if (!prompt && !Array.isArray(messages)) {
         return res.status(400).json({
-            error: 'Missing prompt or messages',
-            code: 'MISSING_AI_INPUT'
+            error: 'Prompt is required',
+            code: 'MISSING_PROMPT'
         });
     }
 
-    const systemMessages = [
-        {
-            role: 'system',
-            content: 'You are a helpful AI tutor for TumiCodes learners. Answer clearly and support the user with code explanations, debugging help, and learning advice.'
-        }
-    ];
+    let finalPrompt = prompt;
 
-    const conversation = Array.isArray(messages)
-        ? messages
-        : [...systemMessages, { role: 'user', content: prompt }];
-
-    const payload = {
-        model: model || 'gpt-4.1',
-        messages: conversation,
-        temperature: 0.7,
-        max_tokens: 700
-    };
+    // Convert chat messages into a single prompt if needed
+    if (!finalPrompt && Array.isArray(messages)) {
+        finalPrompt = messages
+            .map(msg => `${msg.role}: ${msg.content}`)
+            .join('\n');
+    }
 
     try {
-        const apiResponse = await callExternalAI(payload);
-        const choice = Array.isArray(apiResponse.choices) ? apiResponse.choices[0] : null;
-        const reply = choice?.message?.content || choice?.text || '';
+        const apiResponse = await callExternalAI(finalPrompt);
+
+        const reply =
+            apiResponse.response ||
+            apiResponse.reply ||
+            apiResponse.message ||
+            '';
 
         if (!reply) {
-            console.error('AI route received empty response', apiResponse);
+            console.error('Unexpected AI response:', apiResponse);
+
             return res.status(502).json({
-                error: 'AI provider returned no reply',
-                code: 'AI_EMPTY_REPLY'
+                error: 'AI provider returned an empty response',
+                code: 'AI_EMPTY_RESPONSE',
+                raw: apiResponse
             });
         }
 
-        res.json({ reply, raw: apiResponse });
+        res.json({
+            success: true,
+            reply
+        });
+
     } catch (error) {
         console.error('AI route error:', error);
+
         res.status(502).json({
-            error: error.message || 'AI provider request failed',
+            error: error.message,
             code: 'AI_PROVIDER_ERROR'
         });
     }
